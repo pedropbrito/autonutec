@@ -19,24 +19,31 @@ SENHA_APP = os.getenv("SENHA_APP")
 def obter_link_diario_hoje():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(URL_TCE)
+        # Adiciona um User-Agent para simular um navegador Google Chrome real do Windows
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
         
-        # Aguarda a tabela de diários carregar no site
-        page.wait_for_selector("table") 
-        
-        # Como o site pode ter classes específicas, aqui mapeamos o primeiro link que aponta para um PDF
-        # Você pode precisar inspecionar a página e ajustar o seletor ("a[href$='.pdf']") se necessário
-        elemento_pdf = page.locator("a:has-text('Visualizar'), a[href*='pdf']").first
-        
-        if elemento_pdf.count() > 0:
-            link_pdf = elemento_pdf.get_attribute("href")
-            # Garante que o link é absoluto
-            if not link_pdf.startswith("http"):
-                link_pdf = "https://www.tce.ce.gov.br" + link_pdf
-            browser.close()
-            return link_pdf
-        
+        try:
+            # Aumenta o tempo limite de acesso para 60 segundos
+            page.goto(URL_TCE, timeout=60000)
+            
+            # Aguarda diretamente pelo link do PDF (até 60 segundos)
+            page.wait_for_selector("a:has-text('Visualizar'), a[href*='pdf']", timeout=60000)
+            
+            elemento_pdf = page.locator("a:has-text('Visualizar'), a[href*='pdf']").first
+            
+            if elemento_pdf.count() > 0:
+                link_pdf = elemento_pdf.get_attribute("href")
+                if not link_pdf.startswith("http"):
+                    link_pdf = "https://www.tce.ce.gov.br" + link_pdf
+                browser.close()
+                return link_pdf
+                
+        except Exception as e:
+            print(f"Erro ao carregar a página ou encontrar o PDF: {e}")
+            
         browser.close()
         return None
 

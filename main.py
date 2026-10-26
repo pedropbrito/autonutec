@@ -1,10 +1,10 @@
 import os
-import io
 import requests
 import pdfplumber
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from datetime import datetime
 from playwright.sync_api import sync_playwright
 
@@ -15,6 +15,7 @@ EMAILS_DESTINO = ["pedro.brito@nutec.ce.gov.br", "pedropbrito@gmail.com"]
 # Variáveis de ambiente configuradas no GitHub Secrets
 EMAIL_REMETENTE = os.getenv("EMAIL_REMETENTE")
 SENHA_APP = os.getenv("SENHA_APP")
+ARQUIVO_PDF = "diario_oficial.pdf"
 
 def acessar_e_obter_pdf():
     with sync_playwright() as p:
@@ -28,7 +29,6 @@ def acessar_e_obter_pdf():
         try:
             page.goto(URL_TCE, timeout=60000)
             
-            # Aguarda o botão aparecer de forma visível, ignorando processos em 2º plano do site
             seletor_botao = "text='Visualizar completo'"
             page.wait_for_selector(seletor_botao, state="visible", timeout=60000)
             elemento = page.locator(seletor_botao).first
@@ -41,69 +41,60 @@ def acessar_e_obter_pdf():
             except:
                 pass
 
+            # Baixa e salva o PDF localmente para facilitar o envio em anexo
             if href and ".pdf" in href.lower():
                 if not href.startswith("http"):
                     href = "https://www.tce.ce.gov.br" + href
+                resposta = requests.get(href, timeout=60)
+                with open(ARQUIVO_PDF, "wb") as f:
+                    f.write(resposta.content)
                 browser.close()
-                return {"tipo": "link", "dados": href}
+                return ARQUIVO_PDF
             
             with page.expect_download(timeout=60000) as download_info:
                 elemento.click()
             
             download = download_info.value
-            caminho = f"./{download.suggested_filename}"
-            download.save_as(caminho)
+            download.save_as(ARQUIVO_PDF)
             browser.close()
-            
-            return {"tipo": "arquivo", "dados": caminho}
+            return ARQUIVO_PDF
             
         except Exception as e:
             print(f"Erro na automação web: {e}")
             browser.close()
             return None
 
-def ler_pdf(origem):
+def ler_pdf(caminho):
     recortes = []
-    
-    # Prepara o PDF dependendo se veio por link (requests) ou arquivo local baixado
-    if origem["tipo"] == "link":
-        resposta = requests.get(origem["dados"], timeout=60)
-        pdf_obj = io.BytesIO(resposta.content)
-    else:
-        pdf_obj = open(origem["dados"], "rb")
-        
-    with pdfplumber.open(pdf_obj) as pdf:
+    with pdfplumber.open(caminho) as pdf:
         for numero_pagina, pagina in enumerate(pdf.pages, start=1):
             texto = pagina.extract_text()
             if texto and ORGAO_ALVO.upper() in texto.upper():
-                idx = texto.upper().find(ORGAO_ALVO.upper())
-                inicio = max(0, idx - 400)
-                fim = min(len(texto), idx + 800)
-                trecho = texto[inicio:fim].replace('\n', ' ')
-                recortes.append(f"Página {numero_pagina}:\n...{trecho}...\n")
-                
-    # Limpa o arquivo local se houver
-    if origem["tipo"] == "arquivo":
-        pdf_obj.close()
-        if os.path.exists(origem["dados"]):
-            os.remove(origem["dados"])
-        
+                # Extrai o texto completo da página para não ficar suprimido
+                recortes.append(f"--- INÍCIO DA PÁGINA {numero_pagina} ---\n\n{texto}\n\n--- FIM DA PÁGINA {numero_pagina} ---")
     return recortes
 
-def enviar_email(recortes):
+def enviar_email(recortes, caminho_pdf):
     msg = MIMEMultipart()
     msg['Subject'] = f"Alerta Diário TCE-CE - {datetime.now().strftime('%d/%m/%Y')}"
     msg['From'] = EMAIL_REMETENTE
     msg['To'] = ", ".join(EMAILS_DESTINO)
     
-    # Condicional que garante o envio do e-mail em ambos os cenários (encontrado ou não)
     if recortes:
         corpo = f"O órgão '{ORGAO_ALVO}' FOI ENCONTRADO no Diário Oficial de hoje.\n\n"
-        corpo += "Trechos localizados:\n\n" + "\n\n---\n\n".join(recortes)
+        corpo += "Segue em anexo o arquivo PDF original. Abaixo está a transcrição integral da(s) página(s) onde o órgão foi citado:\n\n"
+        corpo += "\n\n".join(recortes)
     else:
         corpo = f"O órgão '{ORGAO_ALVO}' NÃO FOI CITADO no Diário Oficial do TCE-CE da data de hoje.\n"
     
     msg.attach(MIMEText(corpo, 'plain'))
+    
+    # Anexa o arquivo PDF ao e-mail
+    if caminho_pdf and os.path.exists(caminho_pdf):
+        with open(caminho_pdf, "rb") as f:
+            anexo = MIMEApplication(f.read(), _subtype="pdf")
+            anexo.add_header('Content-Disposition', 'attachment', filename="Diario_Oficial_TCE.pdf")
+            msg.attach(anexo)
     
     with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
         smtp.login(EMAIL_REMETENTE, SENHA_APP)
@@ -111,13 +102,18 @@ def enviar_email(recortes):
 
 if __name__ == "__main__":
     print("Iniciando busca do diário...")
-    resultado_pdf = acessar_e_obter_pdf()
+    caminho_pdf = acessar_e_obter_pdf()
     
-    if resultado_pdf:
+    if caminho_pdf:
         print("PDF localizado. Iniciando leitura...")
-        trechos = ler_pdf(resultado_pdf)
+        trechos = ler_pdf(caminho_pdf)
         print(f"Leitura concluída. {len(trechos)} menção(ões) encontrada(s). Enviando e-mail...")
-        enviar_email(trechos)
+        enviar_email(trechos, caminho_pdf)
+        
+        # Exclui o arquivo temporário após o envio
+        if os.path.exists(caminho_pdf):
+            os.remove(caminho_pdf)
+            
         print("Processo finalizado com sucesso.")
     else:
         print("Erro: Não foi possível acessar o PDF de hoje.")

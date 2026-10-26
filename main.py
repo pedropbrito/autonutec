@@ -26,16 +26,13 @@ def acessar_e_obter_pdf():
         page = context.new_page()
         
         try:
-            # Acessa a página e aguarda o carregamento dinâmico dos Resultados
             page.goto(URL_TCE, timeout=60000)
-            page.wait_for_load_state("networkidle", timeout=60000)
             
-            # Localiza o botão exato da imagem
+            # Aguarda o botão aparecer de forma visível, ignorando processos em 2º plano do site
             seletor_botao = "text='Visualizar completo'"
-            page.wait_for_selector(seletor_botao, timeout=60000)
+            page.wait_for_selector(seletor_botao, state="visible", timeout=60000)
             elemento = page.locator(seletor_botao).first
             
-            # Verifica se o botão tem um link direto embutido (href)
             href = None
             try:
                 href = elemento.get_attribute("href")
@@ -50,7 +47,6 @@ def acessar_e_obter_pdf():
                 browser.close()
                 return {"tipo": "link", "dados": href}
             
-            # Se não for link direto, clica no botão e intercepta o download do arquivo
             with page.expect_download(timeout=60000) as download_info:
                 elemento.click()
             

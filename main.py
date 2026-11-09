@@ -147,48 +147,26 @@ def consultar_doe_tce():
 def _listar_urls_cadernos_doe_estadual(data_param, headers):
     """
     Obtém a lista de tuplas (nome_arquivo, url_pdf) para a data `data_param` (YYYYMMDD).
-    1º tenta consultar a página de listagem `pesquisa.doe.seplag.ce.gov.br`.
-    2º se houver timeout (ex.: bloqueio de IP no servidor de busca), consulta diretamente
-       o servidor de arquivos `http://imagens.seplag.ce.gov.br/PDF/{data_param}/do{data_param}pXX.pdf`.
+    1º consulta diretamente o servidor de arquivos `http://imagens.seplag.ce.gov.br/PDF/{data_param}/do{data_param}pXX.pdf`
+       (evitando o bloqueio de IPs estrangeiros existente em `pesquisa.doe.seplag.ce.gov.br`).
+    2º usa `pesquisa.doe.seplag.ce.gov.br` apenas como fallback caso o servidor de imagens não responda.
     """
-    url_listagem = URL_DOE_ESTADUAL_BASE.format(data=data_param)
     cadernos = []
 
-    # Tentativa 1: Página de listagem (pesquisa.doe.seplag.ce.gov.br)
-    try:
-        resp = requests.get(url_listagem, headers=headers, timeout=20)
-        if resp.ok:
-            html = resp.text
-            # Extrai links como: <a href='http://imagens.seplag.ce.gov.br/pdf/20261106/do20261106p01.pdf' target="_blank"> Visualizar </a>
-            matches = re.findall(
-                r"href=['\"]([^'\"]*?(do\d+p\d+\.pdf))['\"]",
-                html,
-                flags=re.IGNORECASE,
-            )
-            for url_pdf, nome_arq in matches:
-                url_completa = urljoin(url_listagem, url_pdf)
-                # Evita redirecionamento 301 trocando /pdf/ por /PDF/ no servidor imagens.seplag
-                url_completa = url_completa.replace(
-                    "imagens.seplag.ce.gov.br/pdf/", "imagens.seplag.ce.gov.br/PDF/"
-                )
-                if (nome_arq, url_completa) not in cadernos:
-                    cadernos.append((nome_arq, url_completa))
-            return "ok", cadernos
-    except Exception as e:
-        print(f"Aviso: falha ao acessar listagem em pesquisa.doe.seplag.ce.gov.br ({e}). Tentando servidor de PDFs diretamente...")
-
-    # Tentativa 2: Busca sequencial direta no servidor nginx (imagens.seplag.ce.gov.br)
+    # Tentativa 1: Busca sequencial direta no servidor de PDFs (imagens.seplag.ce.gov.br)
     algum_servidor_respondeu = False
     for indice in range(1, 15):
         nome_arq = f"do{data_param}p{indice:02d}.pdf"
         url_direta = f"http://imagens.seplag.ce.gov.br/PDF/{data_param}/{nome_arq}"
         try:
-            resp_head = requests.head(url_direta, headers=headers, timeout=15, allow_redirects=True)
+            resp_head = requests.head(
+                url_direta, headers=headers, timeout=15, allow_redirects=True
+            )
             algum_servidor_respondeu = True
             if resp_head.status_code == 200:
                 cadernos.append((nome_arq, url_direta))
             elif resp_head.status_code == 404:
-                # Quando p01 retorna 404, não há publicação na data; quando p03+ retorna 404, acabaram os cadernos
+                # Quando p01 retorna 404, não há publicação na data; quando p02+ retorna 404, acabaram os cadernos
                 break
             else:
                 break
@@ -198,6 +176,27 @@ def _listar_urls_cadernos_doe_estadual(data_param, headers):
 
     if algum_servidor_respondeu:
         return "ok", cadernos
+
+    # Tentativa 2 (Fallback): Página de listagem (pesquisa.doe.seplag.ce.gov.br)
+    url_listagem = URL_DOE_ESTADUAL_BASE.format(data=data_param)
+    try:
+        resp = requests.get(url_listagem, headers=headers, timeout=15)
+        if resp.ok:
+            html = resp.text
+            matches = re.findall(
+                r"href=['\"]([^'\"]*?(do\d+p\d+\.pdf))['\"]",
+                html,
+                flags=re.IGNORECASE,
+            )
+            for url_pdf, nome_arq in matches:
+                url_completa = urljoin(url_listagem, url_pdf).replace(
+                    "imagens.seplag.ce.gov.br/pdf/", "imagens.seplag.ce.gov.br/PDF/"
+                )
+                if (nome_arq, url_completa) not in cadernos:
+                    cadernos.append((nome_arq, url_completa))
+            return "ok", cadernos
+    except Exception as e:
+        print(f"Aviso: falha ao acessar fallback em pesquisa.doe.seplag.ce.gov.br ({e}).")
 
     return "erro_conexao", []
 

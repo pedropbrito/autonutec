@@ -144,136 +144,68 @@ def consultar_doe_tce():
             os.remove(arquivo_temp)
 
 
-def _extrair_url_candidata(href, onclick, url_base):
-    """Extrai URL de um link 'Visualizar' a partir de href ou onclick."""
-    for bruto in (href, onclick):
-        if not bruto:
-            continue
-        match_url = re.search(r"(https?://[^\s'\"<>]+)", bruto)
-        if match_url:
-            return match_url.group(1)
-        match_rel = re.search(r"['\"](/[^\s'\"]+)['\"]", bruto)
-        if match_rel:
-            return urljoin(url_base, match_rel.group(1))
-    if href and not href.lower().startswith("javascript:") and href != "#":
-        return urljoin(url_base, href)
-    return None
-
-
-def _obter_elemento_visualizar_da_linha(linha):
-    """Retorna o elemento clicável 'Visualizar' dentro de uma linha (tr) da tabela."""
-    link_a = linha.locator("a:has-text('Visualizar')")
-    if link_a.count() > 0:
-        return link_a.first
-    qualquer_link = linha.locator("a, button, input[type='button'], [onclick]")
-    if qualquer_link.count() > 0:
-        return qualquer_link.last
-    return linha.get_by_text("Visualizar").last
-
-
-def _baixar_pdf_caderno(page, context, indice_linha, nome_arquivo, data_param, url_listagem):
+def _listar_urls_cadernos_doe_estadual(data_param, headers):
     """
-    Baixa o PDF correspondente à linha `indice_linha` da tabela 'Arquivos do Diário'
-    e salva localmente. Retorna o caminho do arquivo salvo ou None.
+    Obtém a lista de tuplas (nome_arquivo, url_pdf) para a data `data_param` (YYYYMMDD).
+    1º tenta consultar a página de listagem `pesquisa.doe.seplag.ce.gov.br`.
+    2º se houver timeout (ex.: bloqueio de IP no servidor de busca), consulta diretamente
+       o servidor de arquivos `http://imagens.seplag.ce.gov.br/PDF/{data_param}/do{data_param}pXX.pdf`.
     """
-    caminho_temp = f"temp_{nome_arquivo}"
-    if not caminho_temp.lower().endswith(".pdf"):
-        caminho_temp += ".pdf"
+    url_listagem = URL_DOE_ESTADUAL_BASE.format(data=data_param)
+    cadernos = []
 
-    linhas_pdf = page.locator("tr:not(:has(tr))").filter(has_text=re.compile(r"do\d+p\d+\.pdf", re.I))
-    linha = linhas_pdf.nth(indice_linha)
-    elemento = _obter_elemento_visualizar_da_linha(linha)
+    # Tentativa 1: Página de listagem (pesquisa.doe.seplag.ce.gov.br)
+    try:
+        resp = requests.get(url_listagem, headers=headers, timeout=20)
+        if resp.ok:
+            html = resp.text
+            # Extrai links como: <a href='http://imagens.seplag.ce.gov.br/pdf/20261106/do20261106p01.pdf' target="_blank"> Visualizar </a>
+            matches = re.findall(
+                r"href=['\"]([^'\"]*?(do\d+p\d+\.pdf))['\"]",
+                html,
+                flags=re.IGNORECASE,
+            )
+            for url_pdf, nome_arq in matches:
+                url_completa = urljoin(url_listagem, url_pdf)
+                # Evita redirecionamento 301 trocando /pdf/ por /PDF/ no servidor imagens.seplag
+                url_completa = url_completa.replace(
+                    "imagens.seplag.ce.gov.br/pdf/", "imagens.seplag.ce.gov.br/PDF/"
+                )
+                if (nome_arq, url_completa) not in cadernos:
+                    cadernos.append((nome_arq, url_completa))
+            return "ok", cadernos
+    except Exception as e:
+        print(f"Aviso: falha ao acessar listagem em pesquisa.doe.seplag.ce.gov.br ({e}). Tentando servidor de PDFs diretamente...")
 
-    href = elemento.get_attribute("href") or ""
-    onclick = elemento.get_attribute("onclick") or linha.get_attribute("onclick") or ""
-    url_candidata = _extrair_url_candidata(href, onclick, page.url)
-
-    # 1. Tenta baixar diretamente pela URL extraída do link (usando sessão do navegador)
-    if url_candidata:
+    # Tentativa 2: Busca sequencial direta no servidor nginx (imagens.seplag.ce.gov.br)
+    algum_servidor_respondeu = False
+    for indice in range(1, 15):
+        nome_arq = f"do{data_param}p{indice:02d}.pdf"
+        url_direta = f"http://imagens.seplag.ce.gov.br/PDF/{data_param}/{nome_arq}"
         try:
-            resp = context.request.get(url_candidata, timeout=60000)
-            if resp.ok:
-                conteudo = resp.body()
-                if conteudo.startswith(b"%PDF"):
-                    with open(caminho_temp, "wb") as f:
-                        f.write(conteudo)
-                    return caminho_temp
+            resp_head = requests.head(url_direta, headers=headers, timeout=15, allow_redirects=True)
+            algum_servidor_respondeu = True
+            if resp_head.status_code == 200:
+                cadernos.append((nome_arq, url_direta))
+            elif resp_head.status_code == 404:
+                # Quando p01 retorna 404, não há publicação na data; quando p03+ retorna 404, acabaram os cadernos
+                break
+            else:
+                break
         except Exception as e:
-            print(f"Aviso ao baixar diretamente {url_candidata}: {e}")
+            print(f"Aviso: falha ao verificar {url_direta}: {e}")
+            break
 
-    # 2. Clica no elemento 'Visualizar' capturando download, resposta PDF ou nova aba (popup)
-    pdf_bytes_capturados = []
+    if algum_servidor_respondeu:
+        return "ok", cadernos
 
-    def _on_response(response):
-        try:
-            ct = (response.headers.get("content-type") or "").lower()
-            if "application/pdf" in ct or response.url.lower().endswith(".pdf"):
-                body = response.body()
-                if body.startswith(b"%PDF"):
-                    pdf_bytes_capturados.append(body)
-        except Exception:
-            pass
-
-    context.on("response", _on_response)
-    try:
-        try:
-            with page.expect_download(timeout=15000) as download_info:
-                elemento.click()
-            download = download_info.value
-            download.save_as(caminho_temp)
-            return caminho_temp
-        except Exception:
-            pass
-
-        if pdf_bytes_capturados:
-            with open(caminho_temp, "wb") as f:
-                f.write(pdf_bytes_capturados[-1])
-            return caminho_temp
-
-        # Verifica se abriu nova aba/janela (popup) com URL do PDF
-        if len(context.pages) > 1:
-            aba_popup = context.pages[-1]
-            try:
-                aba_popup.wait_for_load_state("domcontentloaded", timeout=15000)
-                url_popup = aba_popup.url
-                if url_popup and url_popup != "about:blank":
-                    resp = context.request.get(url_popup, timeout=60000)
-                    if resp.ok and resp.body().startswith(b"%PDF"):
-                        with open(caminho_temp, "wb") as f:
-                            f.write(resp.body())
-                        return caminho_temp
-            finally:
-                try:
-                    aba_popup.close()
-                except Exception:
-                    pass
-    finally:
-        try:
-            context.remove_listener("response", _on_response)
-        except Exception:
-            pass
-        # Garante que a página principal continue na listagem de cadernos
-        if page.url != url_listagem:
-            page.goto(url_listagem, wait_until="domcontentloaded", timeout=60000)
-
-    # 3. Fallback: URL direta padrão do repositório de imagens do DOE SEPLAG-CE
-    url_fallback = f"http://images.doe.seplag.ce.gov.br/pdf/{data_param}/{nome_arquivo}"
-    try:
-        resp = context.request.get(url_fallback, timeout=60000)
-        if resp.ok and resp.body().startswith(b"%PDF"):
-            with open(caminho_temp, "wb") as f:
-                f.write(resp.body())
-            return caminho_temp
-    except Exception:
-        pass
-
-    return None
+    return "erro_conexao", []
 
 
 def consultar_doe_estadual(data_consulta):
     """
-    Acessa o site do DOE Executivo Estadual (SEPLAG/CE) para `data_consulta`,
-    verifica se há cadernos, varre cada arquivo e extrai apenas as páginas com citação.
+    Acessa o DOE Executivo Estadual (SEPLAG/CE) para `data_consulta`,
+    verifica se há cadernos, baixa e varre cada PDF extraindo apenas as páginas com citação.
     """
     data_param = data_consulta.strftime("%Y%m%d")
     data_formatada = data_consulta.strftime("%d/%m/%Y")
@@ -281,91 +213,86 @@ def consultar_doe_estadual(data_consulta):
 
     print(f"Consultando DOE Estadual para {data_formatada} (data={data_param}): {url}")
 
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+
+    status_listagem, cadernos = _listar_urls_cadernos_doe_estadual(data_param, headers)
+
+    if status_listagem == "erro_conexao":
+        print(
+            "Erro: Timeout ao conectar nos servidores da SEPLAG-CE "
+            "(possível bloqueio de IPs estrangeiros pela SEPLAG-CE)."
+        )
+        return {
+            "status": "erro",
+            "data_formatada": data_formatada,
+            "data_param": data_param,
+            "recortes": [],
+            "anexos": [],
+        }
+
+    if not cadernos:
+        print(f"Nenhum caderno encontrado no DOE Estadual para {data_formatada}.")
+        return {
+            "status": "sem_publicacao",
+            "data_formatada": data_formatada,
+            "data_param": data_param,
+            "recortes": [],
+            "anexos": [],
+        }
+
+    total_arquivos = len(cadernos)
+    print(f"{total_arquivos} arquivo(s) encontrado(s) no DOE Estadual: {[c[0] for c in cadernos]}")
+
     recortes_totais = []
     anexos_totais = []
+    arquivos_baixados = 0
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ),
-            accept_downloads=True,
-        )
-        page = context.new_page()
+    for i, (nome_arquivo, url_pdf) in enumerate(cadernos, start=1):
+        print(f"Baixando e processando arquivo {i}/{total_arquivos}: {nome_arquivo} ({url_pdf})...")
+        caminho_pdf_temp = f"temp_{nome_arquivo}"
 
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
+            resp_pdf = requests.get(url_pdf, headers=headers, timeout=90)
+            if not resp_pdf.ok or not resp_pdf.content.startswith(b"%PDF"):
+                print(f"Não foi possível obter um PDF válido em {url_pdf} (status={resp_pdf.status_code}).")
+                continue
 
-            linhas_pdf = page.locator("tr:not(:has(tr))").filter(
-                has_text=re.compile(r"do\d+p\d+\.pdf", re.I)
+            with open(caminho_pdf_temp, "wb") as f:
+                f.write(resp_pdf.content)
+            arquivos_baixados += 1
+
+            nome_base = os.path.splitext(nome_arquivo)[0]
+            caminho_recorte = f"Paginas_Citadas_{nome_base}.pdf"
+            recortes, pdf_extraido = analisar_pdf_e_extrair_paginas(
+                caminho_pdf_temp,
+                f"DOE Estadual ({nome_arquivo})",
+                caminho_recorte,
             )
-            total_arquivos = linhas_pdf.count()
-
-            if total_arquivos == 0:
-                print(f"Nenhum caderno encontrado no DOE Estadual para {data_formatada}.")
-                browser.close()
-                return {
-                    "status": "sem_publicacao",
-                    "data_formatada": data_formatada,
-                    "data_param": data_param,
-                    "recortes": [],
-                    "anexos": [],
-                }
-
-            print(f"{total_arquivos} arquivo(s) encontrado(s) no DOE Estadual.")
-
-            for i in range(total_arquivos):
-                linha_atual = page.locator("tr:not(:has(tr))").filter(
-                    has_text=re.compile(r"do\d+p\d+\.pdf", re.I)
-                ).nth(i)
-                nome_arquivo = f"do{data_param}p{i + 1:02d}.pdf"
-                try:
-                    texto_linha = linha_atual.inner_text()
-                    match_nome = re.search(r"(do\d+p\d+\.pdf)", texto_linha, re.IGNORECASE)
-                    if match_nome:
-                        nome_arquivo = match_nome.group(1)
-                except Exception:
-                    pass
-
-                print(f"Processando arquivo {i + 1}/{total_arquivos}: {nome_arquivo}...")
-                caminho_pdf_temp = _baixar_pdf_caderno(
-                    page, context, i, nome_arquivo, data_param, url
-                )
-
-                if not caminho_pdf_temp or not os.path.exists(caminho_pdf_temp):
-                    print(f"Não foi possível baixar o arquivo {nome_arquivo}.")
-                    continue
-
-                try:
-                    nome_base = os.path.splitext(nome_arquivo)[0]
-                    caminho_recorte = f"Paginas_Citadas_{nome_base}.pdf"
-                    recortes, pdf_extraido = analisar_pdf_e_extrair_paginas(
-                        caminho_pdf_temp,
-                        f"DOE Estadual ({nome_arquivo})",
-                        caminho_recorte,
-                    )
-                    if recortes:
-                        recortes_totais.extend(recortes)
-                    if pdf_extraido:
-                        anexos_totais.append(pdf_extraido)
-                finally:
-                    if os.path.exists(caminho_pdf_temp):
-                        os.remove(caminho_pdf_temp)
-
-            browser.close()
+            if recortes:
+                recortes_totais.extend(recortes)
+            if pdf_extraido:
+                anexos_totais.append(pdf_extraido)
         except Exception as e:
-            print(f"Erro na automação web (DOE Estadual): {e}")
-            browser.close()
-            return {
-                "status": "erro",
-                "data_formatada": data_formatada,
-                "data_param": data_param,
-                "recortes": [],
-                "anexos": [],
-            }
+            print(f"Erro ao processar {nome_arquivo}: {e}")
+        finally:
+            if os.path.exists(caminho_pdf_temp):
+                os.remove(caminho_pdf_temp)
+
+    if arquivos_baixados == 0:
+        return {
+            "status": "erro",
+            "data_formatada": data_formatada,
+            "data_param": data_param,
+            "recortes": [],
+            "anexos": [],
+        }
 
     status = "encontrado" if recortes_totais else "nao_encontrado"
     return {
